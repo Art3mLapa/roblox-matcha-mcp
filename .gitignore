@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.pnpm-store/
+.DS_Store
+*.log
+.env
+.env.*
+
+# Editor — keep mcp.json local (use mcp.json.example)
+.cursor/mcp.json
+
+# Upstream research artifacts (not part of Matcha MCP)
+matcha-mcp/research/

@@ -37,7 +37,7 @@ local function httpRequestRaw(opts)
             local contentType = headers["Content-Type"] or "application/json"
             return game:HttpPost(url, body, contentType, headers)
         end
-        error("unsupported HTTP method: " .. method)
+        assert(false, "unsupported HTTP method: " .. method)
     end)
 
     if not ok then
@@ -80,12 +80,20 @@ end
 
 local LuaEncode
 do
-    local ok, encoder = pcall(function()
-        return loadstring(game:HttpGet(
+    local ok = pcall(function()
+        local source = game:HttpGet(
             "https://raw.githubusercontent.com/chadhyatt/LuaEncode/refs/heads/master/src/LuaEncode.lua"
-        ))()
+        )
+        if not source or source == "" then return end
+        -- ponytail: Matcha's loadstring drops return values — capture via global
+        _G.__mcp_luaencode = nil
+        local wrapped = 'local __r = (function()\n' .. source .. '\nend)(); _G.__mcp_luaencode = __r'
+        loadstring(wrapped)()
     end)
-    if ok then LuaEncode = encoder end
+    if ok and _G.__mcp_luaencode then
+        LuaEncode = _G.__mcp_luaencode
+        _G.__mcp_luaencode = nil
+    end
 end
 
 -- ponytail: server tools prepend setthreadidentity — Matcha doesn't have it
@@ -108,62 +116,24 @@ local function packValues(...)
     return t
 end
 
-local function normalizeEvalChunk(source)
-    source = stripThreadPrefix(source or "")
-    if source == "" then
-        error("no source code provided")
-    end
-    if not string.match(source, "^%s*return[%s%(]") then
-        source = "return " .. source
-    end
-    return source
-end
+-- ponytail: Matcha's loadstring drops top-level return values.
+-- Expose packValues so wrapped chunks can store results via _G.
+_G.__mcp_pack = packValues
 
 local function loadChunk(source, chunkname)
     local fn, err
-    if typeof(load) == "function" then
-        fn, err = load(source, chunkname, "t", EVAL_ENV)
-    end
-    if not fn and typeof(loadstring) == "function" then
+    -- ponytail: Matcha's load only takes (chunk, chunkname) — extra args ignored
+    if typeof(loadstring) == "function" then
         fn, err = loadstring(source, chunkname)
+    elseif typeof(load) == "function" then
+        fn, err = load(source, chunkname)
     end
+    -- ponytail: Matcha always returns a function (syntax errors print on call,
+    -- never nil+err), so fn should not be nil. Guard anyway with assert.
     if not fn then
-        error(tostring(err or "compile failed"))
+        assert(false, tostring(err or "compile failed"))
     end
     return fn
-end
-
-local function compileChunk(source)
-    return loadChunk(normalizeEvalChunk(source), "MatchaMCP")
-end
-
-local function compileChunkStatements(source)
-    source = stripThreadPrefix(source or "")
-    if source == "" then
-        error("no source code provided")
-    end
-    return loadChunk(source, "MatchaMCP")
-end
-
-local function invokeChunk(fn)
-    local direct = packValues(fn())
-    if direct.n > 0 then
-        return direct
-    end
-    -- ponytail: fallback if bare call loses returns in Matcha
-    local co = coroutine.create(function()
-        return fn()
-    end)
-    local resumePacked = packValues(coroutine.resume(co))
-    if not resumePacked[1] then
-        error(tostring(resumePacked[2]))
-    end
-    local out = { n = math.max(0, resumePacked.n - 1) }
-    for i = 2, resumePacked.n do
-        out[i - 1] = resumePacked[i]
-    end
-    out.n = out.n
-    return out
 end
 
 local function tryEvalAtom(expr)
@@ -251,23 +221,47 @@ local function tryFastEval(source)
 end
 
 local function evalChunkReturns(source)
+    -- Fast path: atoms, dot-paths, backpack probe (avoids loadstring entirely)
     local fast = tryFastEval(source)
     if fast and fast.n > 0 then
         return fast
     end
-    return invokeChunk(compileChunk(source))
+
+    -- ponytail: Matcha's loadstring drops top-level return values.
+    -- Workaround: wrap source in a function, call it, store results via _G.
+    source = stripThreadPrefix(source or "")
+    assert(source ~= "", "no source code provided")
+
+    _G.__mcp_results = nil
+
+    -- Wrap in a function so return values are preserved as a regular
+    -- function call result (not a chunk top-level return, which Matcha drops).
+    local wrapped = 'local function __mcp_fn()\n' .. source .. '\nend\n_G.__mcp_results = _G.__mcp_pack(__mcp_fn())'
+
+    local fn = loadChunk(wrapped, "MatchaMCP")
+    fn() -- runtime errors are pcall-caught by HandleMessage
+
+    local results = _G.__mcp_results
+    _G.__mcp_results = nil
+    if results == nil then
+        return packValues()
+    end
+    return results
 end
 
 local function runSource(source)
     local packed = evalChunkReturns(source)
     if packed.n == 0 then
-        error("code returned no values")
+        assert(false, "code returned no values")
     end
     return packed[1]
 end
 
 local function runChunk(source)
-    invokeChunk(compileChunkStatements(source))
+    source = stripThreadPrefix(source or "")
+    assert(source ~= "", "no source code provided")
+    local fn = loadChunk(source, "MatchaMCP")
+    fn()
 end
 
 local function resolveInstancePath(path)
@@ -370,7 +364,7 @@ local function serializePacked(packed)
         return HttpService:JSONEncode({ count = packed.n, values = values })
     end)
     if not ok then
-        error("JSONEncode: " .. tostring(json))
+        assert(false, "JSONEncode: " .. tostring(json))
     end
     return json
 end
@@ -413,7 +407,9 @@ local ConsoleLogs = {}
 if not _G.__MatchaMCPConsoleHooked then
     _G.__MatchaMCPConsoleHooked = true
     local oldPrint = print
-    print = function(...)
+    local oldWarn = warn
+
+    local function captureLog(levelName, ...)
         local parts = { ... }
         for i = 1, #parts do
             parts[i] = tostring(parts[i])
@@ -422,20 +418,31 @@ if not _G.__MatchaMCPConsoleHooked then
         table.insert(ConsoleLogs, {
             message = msg,
             timestamp = os.time(),
-            messageType = { Name = "Message" },
+            messageType = { Name = levelName },
         })
         if #ConsoleLogs > 500 then
             table.remove(ConsoleLogs, 1)
         end
+    end
+
+    -- ponytail: Matcha's print/warn are real globals — hook them to capture output
+    print = function(...)
+        captureLog("Message", ...)
         return oldPrint(...)
+    end
+    if oldWarn then
+        warn = function(...)
+            captureLog("Warning", ...)
+            return oldWarn(...)
+        end
     end
 end
 
 local function GetRegistrationInfo()
     local player = Players.LocalPlayer
     local placeName = "Unknown"
-    if typeof(getgetname) == "function" then
-        local ok, name = pcall(getgetname)
+    if typeof(getgamename) == "function" then
+        local ok, name = pcall(getgamename)
         if ok and name then placeName = name end
     end
     return {
@@ -520,7 +527,7 @@ function HTTPBridge.new()
     while not self:IsAlive() do
         attempts += 1
         if attempts >= 10 then
-            error("Matcha MCP: bridge not reachable at " .. BridgeURL)
+            assert(false, "Matcha MCP: bridge not reachable at " .. BridgeURL)
         end
         task.wait(retryDelay)
         retryDelay = math.min(retryDelay * 1.5, 5)
@@ -759,9 +766,8 @@ while true do
     end
 
     bridge:BindToType("execute", function(data)
-        task.defer(function()
-            runChunk(data.source or data.code)
-        end)
+        -- ponytail: Matcha's task.defer is a no-op — run directly instead
+        runChunk(data.source or data.code)
     end)
 
     bridge:BindToTypeRaw("get-console-output", function(data)
@@ -772,11 +778,13 @@ while true do
         local summaryOnly = data.summaryOnly == true
 
         local logs = ConsoleLogs
-        if typeof(LogService) ~= "nil" then
-            local ok, history = pcall(function()
-                return game:GetService("LogService"):GetLogHistory()
-            end)
-            if ok and history then logs = history end
+        -- ponytail: try LogService:GetLogHistory() (may not exist in Matcha)
+        local lsOk, logService = pcall(function() return game:GetService("LogService") end)
+        if lsOk and logService then
+            local histOk, history = pcall(function() return logService:GetLogHistory() end)
+            if histOk and history and #history > 0 then
+                logs = history
+            end
         end
 
         local results = {}
@@ -826,7 +834,7 @@ while true do
     bridge:BindToTypeRaw("get-data-by-code", function(data)
         local chunk = data.source or data.code
         if not chunk or chunk == "" then
-            error("no code in request")
+            assert(false, "no code in request")
         end
         return serializePacked(evalChunkReturns(chunk))
     end)
@@ -908,8 +916,8 @@ while true do
 
     bridge:BindToType("get-game-info", function()
         local placeName = "Unknown"
-        if typeof(getgetname) == "function" then
-            local ok, name = pcall(getgetname)
+        if typeof(getgamename) == "function" then
+            local ok, name = pcall(getgamename)
             if ok and name then placeName = name end
         end
         local executor = "Matcha"
@@ -923,7 +931,7 @@ while true do
             JobId = game.JobId,
             PlaceName = placeName,
             Executor = executor,
-            ConnectorVersion = "execute-fix-1",
+            ConnectorVersion = "matcha-fix-2",
         }
     end)
 

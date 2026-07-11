@@ -4,7 +4,7 @@
 
 MCP server that connects AI assistants to a live [Matcha LuaVM](https://doc.wabisabi.mom/matcha/) session. Your agent can run Luau, explore the game tree, decompile scripts, search code, and use Matcha memory APIs — all from Cursor, Claude Code, or any MCP client.
 
-**Repository:** [github.com/wavelyz/roblox-matcha-mcp](https://github.com/wavelyz/roblox-matcha-mcp)
+**Repository:** [github.com/Art3mLapa/roblox-matcha-mcp/](https://github.com/Art3mLapa/roblox-matcha-mcp/)
 
 ```
 AI client  ←stdio→  matcha-mcp (Node, :16385)
@@ -25,7 +25,7 @@ AI client  ←stdio→  matcha-mcp (Node, :16385)
 ### 1. Build the server
 
 ```bash
-git clone https://github.com/wavelyz/roblox-matcha-mcp.git
+git clone https://github.com/Art3mLapa/roblox-matcha-mcp.git
 cd roblox-matcha-mcp/matcha-mcp
 npm install
 npm run build
